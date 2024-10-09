@@ -1,0 +1,24 @@
+import streamlit as st
+
+def show_create_groups():
+    st.title("Create a New Group")
+
+    # Input for the group name
+    group_name = st.text_input("Group Name")
+
+    # Input for user emails
+    email_list = st.text_area("Enter User Emails (one per line)")
+
+    # Button to create the group
+    if st.button("Create Group"):
+        if group_name and email_list:
+            # Split emails into a list, removing any extra spaces
+            emails = [email.strip() for email in email_list.split('\n') if email.strip()]
+
+            if emails:
+                # Placeholder for group creation logic (e.g., send to backend or save)
+                st.success(f"Group '{group_name}' created with members: {', '.join(emails)}")
+            else:
+                st.error("Please enter at least one valid email.")
+        else:
+            st.error("Please provide both a group name and user emails.")
