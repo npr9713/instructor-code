@@ -8,11 +8,23 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.embeddings import SentenceTransformerEmbeddings
 from langchain_community.vectorstores import FAISS
 from groq import Groq
+from pinecone import Pinecone, ServerlessSpec
+import pinecone
+import uuid
+import base64
+
 
 load_dotenv()
 
 
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
+pdf_vectors_index = pinecone.Index("pdf_vectors", host=os.getenv("PINECONE_INDEX_HOST"))
+
+
+user_id_val = []
+def generate_unique_document_id():
+    return str(uuid.uuid4())
 
 
 
@@ -91,7 +103,7 @@ def generate_quiz_questions(context, difficulty, question_type, num_questions):
 def create_vector_store(chunks):
     embeddings = SentenceTransformerEmbeddings(model_name="paraphrase-MiniLM-L6-v2")
     vector_store = FAISS.from_texts(chunks, embeddings)
-    return vector_store
+    return vector_store, chunks, embeddings
 
 def fetch_relevant_documents(query, vector_store, num_chunks=3):
     docs = vector_store.similarity_search(query, k=num_chunks)
@@ -108,21 +120,30 @@ def fetch_groups():
     response = requests.post("http://localhost:3540/find_groups", headers=headers)
     if response.status_code == 200:
         data = response.json()
-        if 'groups' in data:
-            return data['groups']
-        else:
-            st.error("Invalid response structure.")
+        user_id = data.get('mailId', None)
+        groups = data.get('groups', [])
+        if user_id:
+            return user_id, groups
     else:
         st.error("Failed to fetch groups.")
-    return []
+    return None, []
 
 
-def assign_tests(token, group_name, questions):
+def assign_tests(token, group_name, questions,quiz_name,is_retest_needed,max_retests,min_marks_for_retest,total_marks,marks_for_each_qn,vector_store,texts,user_id,document_id,embeddings,pdf_binary):
+    pdf_base64 = base64.b64encode(pdf_binary).decode('utf-8')
     payload = {
         "group": group_name,
-        "questions": questions
+        "questions": questions,
+        "quiz_name":quiz_name,
+        "is_retest_automated":is_retest_needed,
+        "max_retests_allowed":max_retests,
+        "min_marks_for_retest":min_marks_for_retest,
+        "total_marks":total_marks,
+        "marks_for_each_qn":marks_for_each_qn,
+        "pdf_binary":pdf_base64,
+        "document_id":document_id,
     }
-
+    print("payload: ",payload)
     headers = {
         "Authorization": f"Bearer {token}"
     }
@@ -134,23 +155,49 @@ def assign_tests(token, group_name, questions):
 def quiz_generation_app():
     st.title("AI-Powered Quiz Generation")
 
-    groups = fetch_groups()
+    # Ensure session state variables are initialized
+    if 'questions' not in st.session_state:
+        st.session_state['questions'] = None
+    if 'quiz_generated' not in st.session_state:
+        st.session_state['quiz_generated'] = False
+    if 'total_marks' not in st.session_state:
+        st.session_state['total_marks'] = 0
 
 
-    selected_group = st.selectbox("Select Group", groups)
+    if 'groups' not in st.session_state or 'user_id' not in st.session_state:
+        user_id, groups = fetch_groups()
+        if user_id and groups:
+            st.session_state['user_id'] = user_id
+            st.session_state['groups'] = groups
+        else:
+            st.error("Failed to retrieve user ID and groups.")
+            return
 
+    selected_group = st.selectbox("Select Group", st.session_state['groups'])
+    quiz_name = st.text_input("Quiz Name")
+
+    is_retest_needed = st.checkbox("Is automated retest needed?")
+    marks_for_each_qn = st.number_input("Marks for each question", min_value=1, step=1)
+    min_marks_for_retest = 0
+    max_retests = 0;
+
+    if is_retest_needed:
+        max_retests = st.number_input("Max Retests Allowed", min_value=1, step=1)
 
     uploaded_file = st.file_uploader("Upload learning material (PDF)", type=["pdf"])
     if uploaded_file is not None:
+        pdf_binary = uploaded_file.read()
         pdf_text = get_pdf_text(uploaded_file)
         if pdf_text:
             st.write("Learning material uploaded successfully.")
+
 
             query = st.text_input("Enter a query to fetch relevant content (optional)")
 
 
             text_chunks = get_text_chunks(pdf_text)
-            vector_store = create_vector_store(text_chunks)
+            vector_store, texts,embeddings = create_vector_store(text_chunks)
+
 
             difficulty = st.selectbox("Select quiz difficulty", ["Easy", "Medium", "Hard"])
             question_type = st.selectbox("Select question type", ["MCQ", "Fill in the Blanks"])
@@ -160,34 +207,69 @@ def quiz_generation_app():
                 st.write("Generating quiz...")
 
 
-                if query:
-                    context = fetch_relevant_documents(query, vector_store)
-                else:
-                    context = " ".join(text_chunks[:3])
+                context = fetch_relevant_documents(query, vector_store) if query else " ".join(text_chunks[:3])
+
 
                 response = generate_quiz_questions(context, difficulty, question_type, num_questions)
 
+
                 start_index = response.find('[')
-
-
                 end_index = response.rfind(']')
-
-
                 json_string = response[start_index:end_index + 1]
 
 
-                questions = json.loads(json_string)
-                st.write(questions)
+                st.session_state['questions'] = json.loads(json_string)
+                st.session_state['quiz_generated'] = True
 
+
+                st.session_state['total_marks'] = marks_for_each_qn * len(st.session_state['questions'])
+                st.write(st.session_state['questions'])
+                st.write(f"Total Marks: {st.session_state['total_marks']}")
+
+                if is_retest_needed:
+                    min_marks_for_retest = st.number_input("Minimum marks required for retest", min_value=1,
+                                                           max_value=st.session_state['total_marks'])
+                else:
+                    min_marks_for_retest = 0
+
+
+            if st.session_state['quiz_generated']:
                 if st.button("Assign Quiz"):
-                    token = st.session_state.get('token')  # Assuming 'token' is stored in session state
-                    success, message = assign_tests(token, selected_group, questions)
+                    st.write("Assign Quiz button clicked.")
+                    token = st.session_state.get('token')
+                    document_id = generate_unique_document_id()
+                    user_id = st.session_state['user_id']
+
+                    if not token:
+                        st.error("Authorization token is missing.")
+                        return
+
+
+                    success, message = assign_tests(
+                        token,
+                        selected_group,
+                        st.session_state['questions'],
+                        quiz_name,
+                        is_retest_needed,
+                        max_retests,
+                        min_marks_for_retest,
+                        st.session_state['total_marks'],
+                        marks_for_each_qn,
+                        vector_store,
+                        texts,
+                        user_id,
+                        document_id,
+                        embeddings,
+                        pdf_binary
+
+                    )
+
 
                     if success:
-                        # If the response message includes the inserted questions
-                        if isinstance(message, dict) and 'questions' in message:
+                        if 'quiz_id' in message:
+                            message_json = json.loads(message)
                             st.success("Quiz assigned successfully!")
-                            st.write("Inserted Questions")
+                            st.write(f"Quiz ID: {message_json['quiz_id']}")
                         else:
                             st.error("Unexpected response structure.")
                     else:
